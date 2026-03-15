@@ -1,0 +1,38 @@
+{
+  "name": "@danielsimonjr/beyondcompare-mcp",
+  "version": "1.0.0",
+  "description": "MCP server for Beyond Compare - file/folder comparison, merging, and sync for Windows",
+  "main": "index.js",
+  "bin": {
+    "beyondcompare-mcp": "./index.js"
+  },
+  "files": [
+    "index.js",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [
+    "mcp",
+    "beyond-compare",
+    "diff",
+    "compare",
+    "merge",
+    "sync",
+    "windows",
+    "bcomp"
+  ],
+  "author": "Daniel Simon Jr. (https://github.com/danielsimonjr)",
+  "license": "MIT",
+  "type": "commonjs",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.20.2"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/danielsimonjr/beyondcompare-mcp.git"
+  },
+  "homepage": "https://github.com/danielsimonjr/beyondcompare-mcp"
+}
