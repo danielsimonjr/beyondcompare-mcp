@@ -8,6 +8,8 @@ const {
 } = require("@modelcontextprotocol/sdk/types.js");
 const { spawn } = require("child_process");
 const path = require("path");
+const fs = require("fs");
+const os = require("os");
 
 // Path to BComp.com (console version) - can be overridden via environment variable
 const BCOMP_PATH =
@@ -64,12 +66,123 @@ function executeBComp(args, { timeout = 60000 } = {}) {
 }
 
 /**
+ * Create a temporary script file, execute it, read report output, then clean up.
+ * Returns { result, reportContent } where reportContent is the file output (if any).
+ */
+async function executeScript(scriptLines, { timeout = 120000, reportPath = null } = {}) {
+  const scriptPath = path.join(os.tmpdir(), `bc_script_${Date.now()}.txt`);
+  try {
+    fs.writeFileSync(scriptPath, scriptLines.join("\r\n"), "utf-8");
+    const result = await executeBComp(
+      [`@${scriptPath}`, "/silent", "/closescript"],
+      { timeout }
+    );
+    let reportContent = "";
+    if (reportPath) {
+      try {
+        reportContent = fs.readFileSync(reportPath, "utf-8");
+      } catch (e) {
+        reportContent = `(Could not read report: ${e.message})`;
+      }
+    }
+    return { result, reportContent };
+  } finally {
+    try { fs.unlinkSync(scriptPath); } catch (_) {}
+    if (reportPath) {
+      try { fs.unlinkSync(reportPath); } catch (_) {}
+    }
+  }
+}
+
+/**
+ * Parse XML folder report into a human-readable summary.
+ * BC5 XML format uses <filecomp status="same|diff|left|right|newer|older">
+ * with nested <lt>/<rt> blocks containing <name>, <size>, <modified>.
+ * Folder entries use <foldercomp> with optional <lt>/<rt> children.
+ */
+function parseXmlReport(xml) {
+  if (!xml || xml.startsWith("(Could not read")) return xml;
+
+  const lines = [];
+  let same = 0, diff = 0, leftOnly = 0, rightOnly = 0;
+
+  // Build path context by tracking folder hierarchy
+  // We'll use a simpler approach: extract all filecomp entries with their context
+  const fileMatches = xml.matchAll(/<filecomp\s+status="([^"]*)">([\s\S]*?)<\/filecomp>/g);
+
+  for (const match of fileMatches) {
+    const status = match[1];
+    const inner = match[2];
+
+    // Get filename from left or right side
+    const ltName = inner.match(/<lt>[\s\S]*?<name>([^<]*)<\/name>/);
+    const rtName = inner.match(/<rt>[\s\S]*?<name>([^<]*)<\/name>/);
+    const name = (ltName && ltName[1]) || (rtName && rtName[1]) || "unknown";
+
+    if (status === "same") {
+      same++;
+    } else if (status === "diff" || status === "newer" || status === "older") {
+      diff++;
+      lines.push(`  DIFF: ${name} (${status})`);
+    } else if (status === "left") {
+      leftOnly++;
+      lines.push(`  LEFT ONLY: ${name}`);
+    } else if (status === "right") {
+      rightOnly++;
+      lines.push(`  RIGHT ONLY: ${name}`);
+    } else {
+      diff++;
+      lines.push(`  ${status.toUpperCase()}: ${name}`);
+    }
+  }
+
+  // Check for folder-only entries (folders that exist only on one side)
+  // These are <foldercomp> with only <lt> or only <rt> (not both)
+  const folderMatches = xml.matchAll(/<foldercomp>([\s\S]*?)<\/foldercomp>/g);
+  for (const match of folderMatches) {
+    const inner = match[1];
+    const hasLt = /<lt>/.test(inner);
+    const hasRt = /<rt>/.test(inner);
+    if (hasLt && !hasRt) {
+      const nameMatch = inner.match(/<lt>[\s\S]*?<name>([^<]*)<\/name>/);
+      if (nameMatch) {
+        leftOnly++;
+        lines.push(`  LEFT ONLY (folder): ${nameMatch[1]}`);
+      }
+    } else if (!hasLt && hasRt) {
+      const nameMatch = inner.match(/<rt>[\s\S]*?<name>([^<]*)<\/name>/);
+      if (nameMatch) {
+        rightOnly++;
+        lines.push(`  RIGHT ONLY (folder): ${nameMatch[1]}`);
+      }
+    }
+  }
+
+  const summary = [
+    `Summary: ${same} same, ${diff} different, ${leftOnly} left-only, ${rightOnly} right-only`,
+  ];
+
+  if (lines.length > 0) {
+    summary.push("");
+    summary.push("Differences:");
+    if (lines.length > 200) {
+      summary.push(...lines.slice(0, 200));
+      summary.push(`  ... and ${lines.length - 200} more`);
+    } else {
+      summary.push(...lines);
+    }
+  }
+
+  return summary.join("\n");
+}
+
+/**
  * Create and configure the MCP server
  */
 const server = new Server(
   {
     name: "beyondcompare-mcp",
-    version: "1.0.0",
+    version: "1.1.0",
   },
   {
     capabilities: {
@@ -87,7 +200,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       {
         name: "compare_files",
         description:
-          "Compare two files using Beyond Compare. Returns whether files are identical, similar, or different. Use /qc for silent comparison (no GUI) or omit for interactive GUI comparison.",
+          "Compare two files using Beyond Compare. Returns whether files are identical, similar, or different. Silent mode uses /qc for quick comparison without GUI.",
         inputSchema: {
           type: "object",
           properties: {
@@ -131,7 +244,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       {
         name: "compare_folders",
         description:
-          "Compare two folders using Beyond Compare. Shows differences between directory contents including file presence, size, and modification dates.",
+          "Compare two folders using Beyond Compare. In silent mode, generates an XML report listing all differences (files that differ, are missing on either side, etc.). In GUI mode, opens an interactive folder comparison window.",
         inputSchema: {
           type: "object",
           properties: {
@@ -151,8 +264,19 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             silent: {
               type: "boolean",
               description:
-                "If true, performs a quick silent comparison (no GUI). Default: true",
+                "If true, runs a scripted comparison and returns a structured diff report. If false, opens the GUI. Default: true",
               default: true,
+            },
+            criteria: {
+              type: "string",
+              description:
+                "Comparison criteria: 'binary' for byte-by-byte, 'rules-based' for content rules, 'timestamp' for date comparison, 'size' for size only, 'CRC' for checksum. Default: timestamp + size",
+            },
+            showMatches: {
+              type: "boolean",
+              description:
+                "If true, includes matching files in the report (not just differences). Default: false",
+              default: false,
             },
           },
           required: ["left", "right"],
@@ -210,7 +334,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       {
         name: "sync_folders",
         description:
-          "Open a Folder Sync session in Beyond Compare to synchronize two directories. Can mirror, update, or bidirectionally sync folder contents.",
+          "Synchronize two folders using Beyond Compare scripting. Supports update (copy newer/missing files) and mirror (make target identical to source) modes in either direction.",
         inputSchema: {
           type: "object",
           properties: {
@@ -226,6 +350,26 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
               type: "string",
               description:
                 "File filter pattern (e.g., '*.js;*.ts' to include, '-*.log;-node_modules' to exclude)",
+            },
+            mode: {
+              type: "string",
+              description:
+                "Sync mode: 'update' copies newer/orphan files (non-destructive), 'mirror' makes target identical to source (may delete). Default: update",
+              enum: ["update", "mirror"],
+              default: "update",
+            },
+            direction: {
+              type: "string",
+              description:
+                "Sync direction: 'left->right', 'right->left', or 'all' (bidirectional). Default: left->right",
+              enum: ["left->right", "right->left", "all"],
+              default: "left->right",
+            },
+            dryRun: {
+              type: "boolean",
+              description:
+                "If true, generates a report of what would be synced without actually syncing. Default: false",
+              default: false,
             },
           },
           required: ["left", "right"],
@@ -317,40 +461,63 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         ],
       };
     } else if (name === "compare_folders") {
-      const { left, right, filters, silent = true } = args;
+      const {
+        left,
+        right,
+        filters,
+        silent = true,
+        criteria,
+        showMatches = false,
+      } = args;
 
-      const bcompArgs = [];
-
-      if (silent) {
-        bcompArgs.push("/qc");
+      if (!silent) {
+        // GUI mode — just open the folder comparison window
+        const bcompArgs = [left, right];
+        const result = await executeBComp(bcompArgs, { timeout: 5000 });
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Opened folder comparison GUI.\nLeft:  ${left}\nRight: ${right}`,
+            },
+          ],
+        };
       }
 
-      if (filters) {
-        bcompArgs.push(`/filters=${filters}`);
-      }
+      // Script mode — generate temp report
+      const reportPath = path.join(os.tmpdir(), `bc_report_${Date.now()}.xml`);
+      const display = showMatches ? "display-all" : "display-mismatches";
 
-      bcompArgs.push(left, right);
+      const scriptLines = [
+        `log verbose`,
+        `load "${left}" "${right}"`,
+      ];
+      if (filters) scriptLines.push(`filter "${filters}"`);
+      if (criteria) scriptLines.push(`criteria ${criteria}`);
+      scriptLines.push(
+        `expand all`,
+        `folder-report layout:xml output-to:"${reportPath}"`,
+      );
 
-      const result = await executeBComp(bcompArgs, { timeout: 120000 });
+      const { result, reportContent } = await executeScript(scriptLines, {
+        timeout: 120000,
+        reportPath,
+      });
 
-      const verdict =
-        result.code <= 2
-          ? "SAME"
-          : result.code >= 11 && result.code <= 13
-            ? "DIFFERENT"
-            : "ERROR";
+      const parsed = parseXmlReport(reportContent);
 
       return {
         content: [
           {
             type: "text",
             text: [
-              `Folder comparison: ${verdict}`,
+              `Folder comparison (scripted):`,
               `Exit code: ${result.code} (${result.meaning})`,
               `Left:  ${left}`,
               `Right: ${right}`,
-              result.stdout ? `\nOutput:\n${result.stdout}` : "",
-              result.stderr ? `\nStderr:\n${result.stderr}` : "",
+              "",
+              parsed,
+              result.stderr ? `\nLog:\n${result.stderr}` : "",
             ]
               .filter(Boolean)
               .join("\n"),
@@ -404,17 +571,68 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         ],
       };
     } else if (name === "sync_folders") {
-      const { left, right, filters } = args;
+      const {
+        left,
+        right,
+        filters,
+        mode = "update",
+        direction = "left->right",
+        dryRun = false,
+      } = args;
 
-      const bcompArgs = ["/sync"];
+      if (dryRun) {
+        // Dry run: generate a comparison report showing what would change
+        const reportPath = path.join(os.tmpdir(), `bc_sync_preview_${Date.now()}.xml`);
+        const scriptLines = [
+          `log verbose`,
+          `load "${left}" "${right}"`,
+        ];
+        if (filters) scriptLines.push(`filter "${filters}"`);
+        scriptLines.push(
+          `expand all`,
+          `folder-report layout:xml output-to:"${reportPath}"`,
+        );
 
-      if (filters) {
-        bcompArgs.push(`/filters=${filters}`);
+        const { result, reportContent } = await executeScript(scriptLines, {
+          timeout: 120000,
+          reportPath,
+        });
+
+        const parsed = parseXmlReport(reportContent);
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: [
+                `Sync dry run (${mode} ${direction}):`,
+                `Exit code: ${result.code} (${result.meaning})`,
+                `Left:  ${left}`,
+                `Right: ${right}`,
+                "",
+                "Files that would be affected:",
+                parsed,
+                result.stderr ? `\nLog:\n${result.stderr}` : "",
+              ]
+                .filter(Boolean)
+                .join("\n"),
+            },
+          ],
+        };
       }
 
-      bcompArgs.push(left, right);
+      // Actual sync via script
+      const scriptLines = [
+        `log verbose`,
+        `load "${left}" "${right}"`,
+      ];
+      if (filters) scriptLines.push(`filter "${filters}"`);
+      scriptLines.push(
+        `expand all`,
+        `sync ${mode}:${direction}`,
+      );
 
-      const result = await executeBComp(bcompArgs, { timeout: 300000 });
+      const { result } = await executeScript(scriptLines, { timeout: 300000 });
 
       return {
         content: [
@@ -422,11 +640,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             type: "text",
             text: [
               `Folder sync: ${result.code === 0 ? "SUCCESS" : "COMPLETED WITH ISSUES"}`,
+              `Mode: ${mode} (${direction})`,
               `Exit code: ${result.code} (${result.meaning})`,
               `Left:  ${left}`,
               `Right: ${right}`,
               result.stdout ? `\nOutput:\n${result.stdout}` : "",
-              result.stderr ? `\nStderr:\n${result.stderr}` : "",
+              result.stderr ? `\nLog:\n${result.stderr}` : "",
             ]
               .filter(Boolean)
               .join("\n"),
