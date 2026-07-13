@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Windows CI leg.** CI ran on `ubuntu-latest` only — but Windows is the *production*
+  platform for this MCP server (it runs on Daniel's Windows box), so CI had never once
+  tested the OS the server actually ships on. The `build` job now runs a
+  `[ubuntu-latest, windows-latest]` matrix.
+
 ### Fixed
 
 - **CI never ran on the default branch.** `.github/workflows/ci.yml` filtered its
