@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security (2026-08-03)
+
+- `@hono/node-server` 1.19.x -> 2.0.12 (medium, needs 2.0.5), via
+  `@modelcontextprotocol/sdk` 1.29.0 -> 1.30.0.
+
+The hono fix required an indirection: the MCP SDK pinned `@hono/node-server`
+to `^1.19.9`, so no in-range update could reach 2.x. SDK 1.30.0 widened that
+to `^1.19.9 || ^2.0.5` and is itself inside the existing SDK range, so the
+fix is lock-only — no manifest change.
+
+
 ### Added
 
 - **Windows CI leg.** CI ran on `ubuntu-latest` only — but Windows is the *production*
