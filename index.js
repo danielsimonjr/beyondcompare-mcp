@@ -38,6 +38,8 @@ function describeExitCode(code) {
   return EXIT_CODES[code] || `Unknown exit code: ${code}`;
 }
 
+const LINE_DIFF_CONCURRENCY = 24;
+
 /**
  * Execute BComp.com with the given arguments
  */
@@ -124,10 +126,10 @@ function parseXmlReport(xml) {
     } else if (status === "diff" || status === "newer" || status === "older") {
       diff++;
       lines.push(`  DIFF: ${name} (${status})`);
-    } else if (status === "left") {
+    } else if (status === "left" || status === "ltonly") {
       leftOnly++;
       lines.push(`  LEFT ONLY: ${name}`);
-    } else if (status === "right") {
+    } else if (status === "right" || status === "rtonly") {
       rightOnly++;
       lines.push(`  RIGHT ONLY: ${name}`);
     } else {
@@ -174,6 +176,76 @@ function parseXmlReport(xml) {
   }
 
   return summary.join("\n");
+}
+
+function extractDiffFiles(xml) {
+  if (!xml || xml.startsWith("(Could not read")) return [];
+  const results = [];
+  const dirStack = [];
+  let inFile = false;
+  let fileStatus = "";
+  let fileName = null;
+  const tokenRe = /<foldercomp>|<\/foldercomp>|<ltpath>|<filecomp\s+status="([^"]*)">|<\/filecomp>|<lt>\s*<name>([^<]*)<\/name>/g;
+  let m;
+  while ((m = tokenRe.exec(xml)) !== null) {
+    const tok = m[0];
+    if (tok === "<foldercomp>") {
+      dirStack.push(null);
+    } else if (tok === "</foldercomp>") {
+      dirStack.pop();
+    } else if (tok === "<ltpath>") {
+      if (dirStack.length > 0) dirStack[dirStack.length - 1] = "";
+    } else if (tok.startsWith("<filecomp")) {
+      inFile = true;
+      fileStatus = m[1];
+      fileName = null;
+    } else if (tok === "</filecomp>") {
+      if (fileStatus === "diff" && fileName) {
+        const dirs = dirStack.filter((d) => d);
+        results.push(dirs.length ? dirs.join(path.sep) + path.sep + fileName : fileName);
+      }
+      inFile = false;
+      fileStatus = "";
+      fileName = null;
+    } else {
+      const nm = m[2];
+      if (inFile) {
+        if (fileName === null) fileName = nm;
+      } else if (dirStack.length > 0 && dirStack[dirStack.length - 1] === null) {
+        dirStack[dirStack.length - 1] = nm;
+      }
+    }
+  }
+  return results;
+}
+
+async function runPool(items, limit, worker) {
+  const results = new Array(items.length);
+  let cursor = 0;
+  async function runner() {
+    while (cursor < items.length) {
+      const idx = cursor++;
+      results[idx] = await worker(items[idx], idx);
+    }
+  }
+  const workers = Array.from(
+    { length: Math.min(limit, items.length) },
+    () => runner()
+  );
+  await Promise.all(workers);
+  return results;
+}
+
+async function generateFilePatch(leftFile, rightFile, tag) {
+  const reportPath = path.join(os.tmpdir(), `bc_fpatch_${Date.now()}_${tag}.txt`);
+  const { reportContent } = await executeScript(
+    [
+      `file-report layout:patch options:patch-unified output-to:"${reportPath}" "${leftFile}" "${rightFile}"`,
+    ],
+    { timeout: 60000, reportPath }
+  );
+  if (!reportContent || reportContent.startsWith("(Could not read")) return "";
+  return reportContent.replace(/^\uFEFF/, "").replace(/\s+$/, "");
 }
 
 /**
@@ -276,6 +348,12 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
               type: "boolean",
               description:
                 "If true, includes matching files in the report (not just differences). Default: false",
+              default: false,
+            },
+            includeLineDiff: {
+              type: "boolean",
+              description:
+                "If true, additionally generates per-file unified (patch-unified) line-level diffs for every differing file, fetched via a concurrent pool (hardcoded max 24). Default: false",
               default: false,
             },
           },
@@ -468,6 +546,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         silent = true,
         criteria,
         showMatches = false,
+        includeLineDiff = false,
       } = args;
 
       if (!silent) {
@@ -506,6 +585,33 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       const parsed = parseXmlReport(reportContent);
 
+      let lineDiffSection = "";
+      if (includeLineDiff) {
+        const diffFiles = extractDiffFiles(reportContent);
+        if (diffFiles.length > 0) {
+          const patches = await runPool(
+            diffFiles,
+            LINE_DIFF_CONCURRENCY,
+            async (rel, i) => ({
+              rel,
+              patch: await generateFilePatch(
+                path.join(left, rel),
+                path.join(right, rel),
+                i
+              ),
+            })
+          );
+          const blocks = patches
+            .filter((p) => p.patch)
+            .map((p) => `### ${p.rel}\n${p.patch}`);
+          if (blocks.length > 0) {
+            lineDiffSection =
+              `\nLine differences (unified, concurrency=${LINE_DIFF_CONCURRENCY}):\n\n` +
+              blocks.join("\n\n");
+          }
+        }
+      }
+
       return {
         content: [
           {
@@ -517,6 +623,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
               `Right: ${right}`,
               "",
               parsed,
+              lineDiffSection,
               result.stderr ? `\nLog:\n${result.stderr}` : "",
             ]
               .filter(Boolean)
