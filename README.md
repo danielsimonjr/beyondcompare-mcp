@@ -31,8 +31,12 @@ Model Context Protocol (MCP) server for [Beyond Compare](https://www.scootersoft
 ```bash
 git clone https://github.com/danielsimonjr/beyondcompare-mcp.git
 cd beyondcompare-mcp
-npm install
+bun install
+bun run build
 ```
+
+The server is written in TypeScript and builds to `dist/`. Bun is the development
+toolchain; Node is the runtime the server ships on.
 
 ## Configuration
 
@@ -45,7 +49,7 @@ Add to your `claude_desktop_config.json`:
   "mcpServers": {
     "beyondcompare-mcp": {
       "command": "node",
-      "args": ["C:\\mcp-servers\\beyondcompare-mcp\\index.js"]
+      "args": ["C:\\mcp-servers\\beyondcompare-mcp\\dist\\index.js"]
     }
   }
 }
@@ -60,7 +64,7 @@ Add to your `~/.claude/.mcp.json`:
   "mcpServers": {
     "beyondcompare-mcp": {
       "command": "node",
-      "args": ["C:\\mcp-servers\\beyondcompare-mcp\\index.js"]
+      "args": ["C:\\mcp-servers\\beyondcompare-mcp\\dist\\index.js"]
     }
   }
 }
@@ -75,7 +79,7 @@ If Beyond Compare is installed in a non-default location, set the `BCOMP_PATH` e
   "mcpServers": {
     "beyondcompare-mcp": {
       "command": "node",
-      "args": ["C:\\mcp-servers\\beyondcompare-mcp\\index.js"],
+      "args": ["C:\\mcp-servers\\beyondcompare-mcp\\dist\\index.js"],
       "env": {
         "BCOMP_PATH": "D:\\Programs\\Beyond Compare 5\\BComp.com"
       }
@@ -93,7 +97,7 @@ Add to `.vscode/mcp.json`:
   "servers": {
     "beyondcompare-mcp": {
       "command": "node",
-      "args": ["C:\\mcp-servers\\beyondcompare-mcp\\index.js"]
+      "args": ["C:\\mcp-servers\\beyondcompare-mcp\\dist\\index.js"]
     }
   }
 }
@@ -294,12 +298,33 @@ Beyond Compare requires a license for full functionality. A 30-day trial is avai
 git clone https://github.com/danielsimonjr/beyondcompare-mcp.git
 cd beyondcompare-mcp
 
-# Install dependencies
-npm install
+# Install dependencies (Bun >= 1.4.2)
+bun install
 
-# Test locally
-node index.js
+# Type-check, test, build
+bun run typecheck
+bun run test
+bun run build
+
+# Run the built server the way a client does
+node dist/index.js
+
+# Confirm the built artifact speaks MCP
+node scripts/smoke.mjs
 ```
+
+### Layout
+
+| Path | Holds |
+|---|---|
+| `src/bcomp.ts` | Locating and running BComp.com; exit-code meanings |
+| `src/report.ts` | Parsing Beyond Compare XML folder reports |
+| `src/tools.ts` | Tool schemas paired with their handlers |
+| `src/server.ts` | `buildServer()` -- MCP wiring, no side effects |
+| `src/index.ts` | Entry point: connect stdio and start |
+
+The tests import these modules directly. `src/index.ts` is the only file that starts
+anything, which is what keeps the rest testable.
 
 ## Contributing
 

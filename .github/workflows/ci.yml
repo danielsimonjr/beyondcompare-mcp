@@ -19,9 +19,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Windows is the PRODUCTION platform for this MCP server (Daniel runs it
-        # locally on Windows), but CI was Linux-only — i.e. it never tested the OS
-        # the server actually ships on.
+        # Windows is the PRODUCTION platform for this MCP server: it drives
+        # BComp.com, a Windows executable. CI was Linux-only, so it never tested the
+        # OS the server actually ships on. Linux stays in the matrix because the pure
+        # logic (report parsing, exit-code mapping) must not become Windows-only.
         os: [ubuntu-latest, windows-latest]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -31,10 +32,14 @@ jobs:
       - name: Setup Bun
         uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
-          bun-version: '1.4.0'
+          bun-version: '1.4.2'
       - run: bun install --frozen-lockfile
-      # --if-present: run each stage only if the repo defines it (universal template).
-      - run: bun run --if-present typecheck
-      - run: bun run --if-present lint
-      - run: bun run --if-present test
-      - run: bun run --if-present build
+      # NOT --if-present. That flag passes silently when a script is missing, so a
+      # typo in a script name produces a green run that checked nothing. These four
+      # all exist in package.json; if one is removed, CI should fail and say so.
+      - run: bun run typecheck
+      - run: bun run test
+      - run: bun run build
+      # Test the artifact that ships, not the sources it was built from: start the
+      # built server and confirm it speaks MCP.
+      - run: node scripts/smoke.mjs
